@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 # WordPress on GCP — Security Audit (v2)
-# This script performs read-only checks for a WordPress deployment behind
-# Google Cloud HTTP(S) Load Balancing. Output is grouped as PASS/WARN/FAIL and
-# the script DOES NOT exit with a non-zero code; instead it prints an ordered
-# summary so you can decide what to fix first.
+# Generic-friendly input layer:
+# - Reads flags (CLI), then .env, then environment variables.
+# - Falls back to gcloud default project / interactive prompts (if TTY).
+# - Provides `--make-env` to scaffold a .env template quickly.
 
 set -u
 
-#############################
-# Configuration (env-driven)
-#############################
-: "${PROJECT_ID:?Set PROJECT_ID}"
-: "${DOMAIN:?Set DOMAIN}"              # example.com (apex)
+#########################################
+# Nice exit on Ctrl-C
+#########################################
+trap 'echo; echo "Aborted."; exit 130' INT
+
+#########################################
+# Defaults (can be overridden by .env / CLI / ENV)
+#########################################
+PROJECT_ID="${PROJECT_ID:-}"
+DOMAIN="${DOMAIN:-}"                # example.com (apex)
 REGION="${REGION:-me-west1}"
 ZONE="${ZONE:-me-west1-b}"
 LB_IP_NAME="${LB_IP_NAME:-wp-lb-ip}"
@@ -21,53 +26,193 @@ HTTPS_PROXY="${HTTPS_PROXY:-wp-https-proxy}"
 HTTP_FR="${HTTP_FR:-wp-http-fr}"
 HTTPS_FR="${HTTPS_FR:-wp-https-fr}"
 IGM="${IGM:-wp-igm}"
-INSTANCE="${INSTANCE:-}"               # optional; if set, will SSH via IAP
+INSTANCE="${INSTANCE:-}"            # optional; if set, will SSH via IAP
 ASSET_PATH="${ASSET_PATH:-/wp-includes/css/dist/block-library/style.css}"
 
-# Flags (via CLI)
-FAST=0            # skip slower checks (SSH/IAP, policy listings)
-NO_COLOR=0        # disable ANSI colors
+FAST=0          # --fast
+NO_COLOR=0     # --no-color
 
-#############################
-# Argument parsing
-#############################
-usage(){ cat <<USAGE
-Usage: PROJECT_ID=... DOMAIN=example.com ./wp_sec_audit_v2.sh [--fast] [--no-color] [--help]
+#########################################
+# Helpers
+#########################################
+is_tty() { [[ -t 0 && -t 1 ]]; }
+have() { command -v "$1" >/dev/null 2>&1; }
+die() { echo "Error: $*" >&2; exit 64; }
 
-Environment variables:
-  PROJECT_ID            (required) GCP project id
-  DOMAIN                (required) apex domain (e.g., example.com)
-  REGION                default: ${REGION}
-  ZONE                  default: ${ZONE}
-  LB_IP_NAME            default: ${LB_IP_NAME}
-  BACKEND               default: ${BACKEND}
-  HTTP_PROXY            default: ${HTTP_PROXY}
-  HTTPS_PROXY           default: ${HTTPS_PROXY}
-  HTTP_FR               default: ${HTTP_FR}
-  HTTPS_FR              default: ${HTTPS_FR}
-  IGM                   default: ${IGM}
-  INSTANCE              optional: VM name for remote wp-config checks (via IAP)
-  ASSET_PATH            default: ${ASSET_PATH}
+banner() {
+  echo "=============================================="
+  echo "  WordPress on GCP — Security Audit (v2)"
+  echo "=============================================="
+}
 
-Flags:
-  --fast                skip slower checks (SSH, detailed policy listings)
-  --no-color            disable ANSI colors (use in CI)
-  --help                show this help
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./wp_sec_audit_v2.sh [FLAGS] [--]                # will prompt if needed (interactive)
+  PROJECT_ID=... DOMAIN=example.com ./wp_sec_audit_v2.sh [FLAGS]
+
+Flags / Options:
+  --project ID                GCP project id
+  --domain DOMAIN             Apex domain (e.g., example.com)
+  --region REGION             Default: me-west1
+  --zone ZONE                 Default: me-west1-b
+  --lb-ip-name NAME           Default: wp-lb-ip
+  --backend NAME              Default: wp-backend
+  --http-proxy NAME           Default: wp-http-proxy
+  --https-proxy NAME          Default: wp-https-proxy
+  --http-fr NAME              Default: wp-http-fr
+  --https-fr NAME             Default: wp-https-fr
+  --igm NAME                  Default: wp-igm
+  --instance NAME             Optional VM for IAP SSH (wp-config checks)
+  --asset-path PATH           Asset path for cache tests (default WP CSS)
+  --fast                      Skip slower checks (SSH, policy listings)
+  --no-color                  Disable ANSI colors (CI-friendly)
+  --make-env                  Create a .env template and exit
+  --help, -h                  Show this help and exit
+
+Precedence of config (highest first):
+  1) CLI flags
+  2) ./.env (if exists)
+  3) Environment variables
+  4) gcloud default project (for PROJECT_ID)
+  5) Interactive prompts (when running in a TTY)
+
+Examples:
+  ./wp_sec_audit_v2.sh --project my-proj --domain example.com
+  ./wp_sec_audit_v2.sh --fast --no-color
+  PROJECT_ID=my-proj DOMAIN=example.com ./wp_sec_audit_v2.sh
 USAGE
 }
 
-for arg in "$@"; do
+write_env_template() {
+  cat > .env <<EOF
+# Copy this file to .env and adjust values.
+PROJECT_ID=${PROJECT_ID}
+DOMAIN=${DOMAIN}
+REGION=${REGION}
+ZONE=${ZONE}
+LB_IP_NAME=${LB_IP_NAME}
+BACKEND=${BACKEND}
+HTTP_PROXY=${HTTP_PROXY}
+HTTPS_PROXY=${HTTPS_PROXY}
+HTTP_FR=${HTTP_FR}
+HTTPS_FR=${HTTPS_FR}
+IGM=${IGM}
+INSTANCE=${INSTANCE}
+ASSET_PATH=${ASSET_PATH}
+# Flags are passed via CLI: --fast / --no-color
+EOF
+  echo "Created .env template in $(pwd)/.env"
+}
+
+#########################################
+# Parse CLI flags (supports --key=value and --key value)
+#########################################
+# First, if .env exists, source it (weak precedence; will be overridden by explicit CLI)
+if [[ -f .env ]]; then
+  # shellcheck disable=SC1091
+  source ./.env
+fi
+
+parse_arg() { # parse_arg KEY VALUE
+  local k="$1" v="$2"
+  case "$k" in
+    project) PROJECT_ID="$v" ;;
+    domain) DOMAIN="$v" ;;
+    region) REGION="$v" ;;
+    zone) ZONE="$v" ;;
+    lb-ip-name) LB_IP_NAME="$v" ;;
+    backend) BACKEND="$v" ;;
+    http-proxy) HTTP_PROXY="$v" ;;
+    https-proxy) HTTPS_PROXY="$v" ;;
+    http-fr) HTTP_FR="$v" ;;
+    https-fr) HTTPS_FR="$v" ;;
+    igm) IGM="$v" ;;
+    instance) INSTANCE="$v" ;;
+    asset-path) ASSET_PATH="$v" ;;
+    *) die "Unknown option: --$k" ;;
+  esac
+}
+
+argv=("$@")
+i=0
+while (( i < ${#argv[@]} )); do
+  arg="${argv[$i]}"
   case "$arg" in
+    --help|-h) usage; exit 0 ;;
     --fast) FAST=1 ;;
     --no-color) NO_COLOR=1 ;;
-    --help|-h) usage; exit 0 ;;
-    *) echo "Unknown argument: $arg" >&2; usage; exit 64 ;;
+    --make-env) write_env_template; exit 0 ;;
+    --*=*)
+      key="${arg%%=*}"; key="${key#--}"
+      val="${arg#*=}"
+      [[ -z "$val" ]] && die "Missing value for --$key"
+      parse_arg "$key" "$val"
+      ;;
+    --*)
+      key="${arg#--}"
+      (( i++ )) || true
+      [[ $i -ge ${#argv[@]} ]] && die "Missing value for --$key"
+      val="${argv[$i]}"
+      parse_arg "$key" "$val"
+      ;;
+    --) shift; break ;; # stop parsing
+    *) die "Unknown argument: $arg (use --help)" ;;
   esac
+  (( i++ ))
 done
 
-#############################
-# UI helpers & dependencies
-#############################
+#########################################
+# Try defaults from gcloud if missing
+#########################################
+if [[ -z "${PROJECT_ID}" ]] && have gcloud; then
+  PROJECT_ID="$(gcloud config get-value project 2>/dev/null || true)"
+  PROJECT_ID="${PROJECT_ID:-}"
+fi
+
+#########################################
+# Interactive prompts if still missing & TTY
+#########################################
+prompt_var() {
+  local var="$1" msg="$2" def="${3:-}"
+  local current
+  # shellcheck disable=SC2015,SC2086
+  current="$(eval "echo \${$var:-}")"
+  if [[ -n "$current" ]]; then return 0; fi
+  if is_tty; then
+    if [[ -n "$def" ]]; then
+      read -r -p "$msg [$def]: " ans || true
+      ans="${ans:-$def}"
+    else
+      read -r -p "$msg: " ans || true
+    fi
+    # shellcheck disable=SC2140
+    eval "$var=\"\$ans\""
+  fi
+}
+
+prompt_var PROJECT_ID "Enter GCP PROJECT_ID"
+prompt_var DOMAIN "Enter apex DOMAIN (e.g., example.com)"
+prompt_var REGION "Region" "$REGION"
+prompt_var ZONE "Zone" "$ZONE"
+
+# Minimal validation
+[[ -z "$PROJECT_ID" ]] && die "PROJECT_ID is required"
+[[ -z "$DOMAIN" ]] && die "DOMAIN is required"
+if ! [[ "$DOMAIN" =~ ^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$ ]]; then
+  die "DOMAIN '$DOMAIN' doesn't look like a valid apex domain"
+fi
+
+#########################################
+# Dependencies
+#########################################
+for bin in gcloud dig curl awk sed; do
+  have "$bin" || die "Missing dependency: $bin"
+done
+
+#########################################
+# Colors & UI
+#########################################
 if [[ -t 1 && $NO_COLOR -eq 0 ]]; then
   GRN="\e[32m"; RED="\e[31m"; YLW="\e[33m"; BLU="\e[36m"; RST="\e[0m"
 else
@@ -76,28 +221,23 @@ fi
 ok(){   printf "%b[PASS]%b %s\n" "$GRN" "$RST" "$*"; }
 bad(){  printf "%b[FAIL]%b %s\n" "$RED" "$RST" "$*"; }
 wrn(){  printf "%b[WARN]%b %s\n" "$YLW" "$RST" "$*"; }
-hdr(){
-  CURRENT_SECTION="$*"
-  printf "\n%b== %s ==%b\n" "$BLU" "$*" "$RST"
-}
+hdr(){  CURRENT_SECTION="$*"; printf "\n%b== %s ==%b\n" "$BLU" "$*" "$RST"; }
+
 SUM_OK=0; SUM_BAD=0; SUM_WRN=0
-# Collected items for ordered summary
 declare -a PASS_ITEMS WARN_ITEMS FAIL_ITEMS
 CURRENT_SECTION="Start"
 OK(){ ok "$@"; ((SUM_OK++)); PASS_ITEMS+=("${CURRENT_SECTION} | $*"); }
 BAD(){ bad "$@"; ((SUM_BAD++)); FAIL_ITEMS+=("${CURRENT_SECTION} | $*"); }
 WRN(){ wrn "$@"; ((SUM_WRN++)); WARN_ITEMS+=("${CURRENT_SECTION} | $*"); }
 
-# Required tools
-for bin in gcloud dig curl awk sed; do
-  if ! command -v "$bin" >/dev/null 2>&1; then bad "Missing dependency: $bin"; exit 3; fi
-done
-
 GCLOUD=(gcloud --project="${PROJECT_ID}")
 _curl(){ curl -fsS --connect-timeout 5 --max-time 15 --retry 2 --retry-all-errors "$@"; }
-
-# Small helpers
 val_or_dash(){ local v="$1"; [[ -n "$v" ]] && printf "%s" "$v" || printf "-"; }
+
+banner
+echo "Project: ${PROJECT_ID} | Domain: ${DOMAIN}"
+echo "Region: ${REGION} | Zone: ${ZONE}"
+(( FAST )) && echo "(FAST mode enabled)"
 
 #########################################
 # 1) DNS
@@ -197,7 +337,6 @@ fi
 #########################################
 hdr "Security Headers"
 H="$(_curl -I "https://${DOMAIN}" || true)"
-# HSTS strong check
 HSTS_LINE="$(echo "$H" | awk 'BEGIN{IGNORECASE=1}/^strict-transport-security:/{print tolower($0)}')"
 if [[ -n "$HSTS_LINE" ]]; then
   maxage="$(echo "$HSTS_LINE" | sed -n 's/.*max-age=\([0-9]\+\).*/\1/p')"
@@ -211,12 +350,9 @@ if [[ -n "$HSTS_LINE" ]]; then
 else
   BAD "HSTS missing"
 fi
-
-# Other headers
 echo "$H" | grep -qi '^x-frame-options:'         && OK "X-Frame-Options present"        || WRN "X-Frame-Options missing"
 echo "$H" | grep -qi '^x-content-type-options:'  && OK "X-Content-Type-Options present" || WRN "X-Content-Type-Options missing"
 echo "$H" | grep -qi '^referrer-policy:'         && OK "Referrer-Policy present"        || WRN "Referrer-Policy missing"
-# Optional but recommended
 if echo "$H" | grep -qi '^content-security-policy:'; then OK "CSP present (ensure it does not break WP)"; else WRN "CSP not set (optional, but recommended)"; fi
 if echo "$H" | grep -qi '^permissions-policy:'; then OK "Permissions-Policy present"; else WRN "Permissions-Policy missing"; fi
 if echo "$H" | grep -qi '^cross-origin-embedder-policy:'; then OK "COEP present"; else WRN "COEP missing"; fi
@@ -286,16 +422,13 @@ if (( FAST == 0 )) && [[ -n "${INSTANCE}" ]]; then
 set -u
 FILE=/var/www/html/wp-config.php
 if [[ ! -f "$FILE" ]]; then echo "[FAIL] wp-config.php missing"; exit 0; fi
-
 grep -q "HTTP_X_FORWARDED_PROTO" "$FILE" && echo "[PASS] Handles HTTPS behind LB (X-Forwarded-Proto)" || echo "[FAIL] Missing handling of X-Forwarded-Proto"
-
 grep -q "DISALLOW_FILE_EDIT" "$FILE" && echo "[PASS] DISALLOW_FILE_EDIT" || echo "[WARN] Dashboard file editor is enabled (recommend disabling)"
-
 grep -q "FORCE_SSL_ADMIN" "$FILE" && echo "[PASS] FORCE_SSL_ADMIN" || echo "[WARN] Recommend FORCE_SSL_ADMIN"
 ' 2>/dev/null || true
 else
   hdr "WordPress wp-config.php checks"
-  WRN "Skipped remote wp-config checks (set INSTANCE or run without --fast)"
+  WRN "Skipped remote wp-config checks (set --instance or run without --fast)"
 fi
 
 #########################################
@@ -369,7 +502,7 @@ else
 fi
 
 #########################################
-# Summary (no exit; ordered action list)
+# Summary
 #########################################
 hdr "Summary"
 printf "PASS=%d  WARN=%d  FAIL=%d\n" "$SUM_OK" "$SUM_WRN" "$SUM_BAD"
